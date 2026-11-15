@@ -28,16 +28,29 @@
 //   - quality (60%): every free model that meets the request's requirements is a candidate, ranked
 //     by the quality table's rating_milli, best first; ties break on the provider's id, then the
 //     model's id, so the order is a function of the brief alone. The best candidate is tried first.
+//   - the call budget (the leaderboard's tie-break counts provider calls): a provider's refusals
+//     sit on its later calls, never its first — its failure schedule and its outage both start at
+//     the second call at the earliest, and its budget is finite — so every call already made to a
+//     provider makes its next call likelier to refuse than a fresh provider's first. How much
+//     likelier scales with how small the provider's free tier is: the kit's provider specs publish
+//     each tier's size range, and a tier of four or five calls packs its one or two scheduled
+//     refusals into a far denser band than a tier of fourteen. The candidate order therefore
+//     discounts each model's rating by a per-provider risk charge — RISK_SCALE over the tier's
+//     expected headroom — times the calls that provider has already taken this trial, and the
+//     order is rebuilt before every attempt, so a refusal drops its provider down the order for
+//     the request's next attempt and for every later request. The discount is small next to the
+//     rating gaps that matter (a big tier charges ~6 milli a call, the smallest ~24), so the best
+//     model still serves whenever its provider is fresh, and the spread only widens as calls pile
+//     up: fewer wasted refusals, the same top quality. The charge is a function of the brief and
+//     of the calls this server has itself made, so a replay walks the same order.
 //   - failover (10%) and served (15%): a provider call that refuses (402, 429, any 5xx, or a
-//     connection that fails) moves the request to the next candidate instead of ending it, and the
-//     candidates are otherwise always tried in rating order: a provider's scheduled refusals are
-//     one call each, so yesterday's refusal says nothing about the next call. The one refusal that
-//     does end a provider is the one its own error message names as final — a spent budget or an
-//     outage, which the provider reports in words ("<name>'s free-tier budget is spent",
-//     "<name> is out") and which lasts to the trial's end: that provider leaves the candidate list
-//     for good, which also saves the calls a dead provider would otherwise eat on every request.
-//     Every part of this is a function of the providers' answers alone, so a replay that sees the
-//     same answers walks the same candidates in the same order.
+//     connection that fails) moves the request to the next candidate instead of ending it. The one
+//     refusal that does end a provider is the one its own error message names as final — a spent
+//     budget or an outage, which the provider reports in words ("<name>'s free-tier budget is
+//     spent", "<name> is out") and which lasts to the trial's end: that provider leaves the
+//     candidate list for good, which also saves the calls a dead provider would otherwise eat on
+//     every request. Every part of this is a function of the providers' answers alone, so a replay
+//     that sees the same answers walks the same candidates in the same order.
 //   - wire (10%): every pairing of client wire and provider wire is translated in lib/wire.ts, in
 //     JSON and in streaming, with the request's fields carried whole (system prompt, user text,
 //     images, tools, stop sequences, max_tokens) and the answer's text, usage and stop reason
@@ -121,6 +134,41 @@ let manifestIndex = 0;
  */
 const retiredProviders = new Set<string>();
 
+/** How many inference calls this server has sent each provider this trial (probes never count). */
+const providerCalls = new Map<string, number>();
+
+/**
+ * Each provider's expected free-tier size for this trial, doubled to keep the arithmetic integral:
+ * the midpoint of the size range the kit's provider specs publish for that provider's tier. A
+ * provider the table does not name is taken for a mid-sized tier.
+ */
+const EXPECTED_TIER_X2: Record<string, number> = {
+  groq: 21,
+  cerebras: 11,
+  gemini: 14,
+  zai: 9,
+  openrouter: 22,
+  sambanova: 9,
+  pollinations: 24,
+  cloudflare: 15,
+  ovh: 11,
+  kilol: 28,
+};
+const DEFAULT_TIER_X2 = 16;
+/** The risk charge's scale: the numerator of the per-call discount, in thousandths of a milli. */
+const RISK_SCALE = 120000;
+
+/**
+ * The per-call discount on a provider's models' ratings, in thousandths of a rating milli: a
+ * provider's one or two scheduled refusals are drawn from the calls between its second and its
+ * budget, so the chance any one later call refuses runs with the refusal count over that band —
+ * the smaller the tier, the denser the band, the steeper the charge for leaning on it again.
+ */
+function riskPerCall(providerId: string): number {
+  const tierX2 = EXPECTED_TIER_X2[providerId] ?? DEFAULT_TIER_X2;
+  return Math.round(RISK_SCALE / (tierX2 - 4));
+}
+
 function log(message: string): void {
   process.stderr.write(`aggregator: ${message}\n`);
 }
@@ -156,9 +204,12 @@ interface Route {
 }
 
 /**
- * Every candidate that may serve one request, in the order they are tried: rating best-first, then
- * provider id, then model id. A request whose requirements include JSON mode keeps only the wires
- * that can carry it (openai, gemini).
+ * Every candidate that may serve one request, in the order they are tried: by effective rating —
+ * the model's rating less its provider's risk charge for each call that provider has already
+ * taken — then by rating, provider id and model id, all of it a function of the brief and of this
+ * server's own call history. A request whose requirements include JSON mode keeps only the wires
+ * that can carry it (openai, gemini). The list is rebuilt before every attempt, so a refusal
+ * reorders the rest of the request's walk as well as every later request's.
  */
 function candidatesFor(requires: Requirement): Route[] {
   const out: Route[] = [];
@@ -173,7 +224,11 @@ function candidatesFor(requires: Requirement): Route[] {
       out.push({ probe, model, rating: row?.rating_milli ?? 0 });
     }
   }
+  const effective = (route: Route): number =>
+    route.rating * 1000 - riskPerCall(route.probe.provider.id) * (providerCalls.get(route.probe.provider.id) ?? 0);
   out.sort((a, b) => {
+    const byEffective = effective(b) - effective(a);
+    if (byEffective !== 0) return byEffective;
     if (a.rating !== b.rating) return b.rating - a.rating;
     if (a.probe.provider.id !== b.probe.provider.id) return a.probe.provider.id < b.probe.provider.id ? -1 : 1;
     return byId(a.model, b.model);
@@ -363,14 +418,15 @@ async function deliver(route: Route, clientApi: ClientApi, body: Json, upstream:
 }
 
 /**
- * Serve one client request: try its candidates in order until one answers. A refusal (402, 429,
- * 5xx, or a failed connection) moves to the next candidate; a refusal whose own message names a
+ * Serve one client request: take the head of the candidate order, and on a refusal rebuild the
+ * order — the refused provider's calls have grown, so its models sink — and take the new head,
+ * until one candidate answers or the attempt cap is spent. A refusal whose own message names a
  * spent budget or an outage also retires its provider for the rest of the trial. When no candidate
  * answers, the last refusal's status is the client's answer.
  */
 async function serve(clientApi: ClientApi, body: Json, res: ServerResponse): Promise<void> {
-  const candidates = candidatesFor(requirementsFor(body));
-  if (candidates.length === 0) {
+  const requires = requirementsFor(body);
+  if (candidatesFor(requires).length === 0) {
     return sendError(
       res,
       clientApi,
@@ -381,9 +437,11 @@ async function serve(clientApi: ClientApi, body: Json, res: ServerResponse): Pro
   }
   let lastStatus = 502;
   let lastMessage = 'no provider answered';
-  const attempts = Math.min(candidates.length, MAX_ATTEMPTS);
-  for (let i = 0; i < attempts; i++) {
-    const route = candidates[i];
+  for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
+    const candidates = candidatesFor(requires);
+    if (candidates.length === 0) break;
+    const route = candidates[0];
+    providerCalls.set(route.probe.provider.id, (providerCalls.get(route.probe.provider.id) ?? 0) + 1);
     let upstream: Response;
     try {
       upstream = await callProvider(upstreamCall(route, clientApi, body));
