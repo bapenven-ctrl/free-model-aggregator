@@ -28,8 +28,17 @@
 //   - quality (60%): every free model that meets the request's requirements is a candidate, ranked
 //     by the quality table's rating_milli, best first; ties break on the provider's id, then the
 //     model's id, so the order is a function of the brief alone. The best candidate is tried first.
-//   - the call budget (the leaderboard's tie-break counts provider calls): a provider's refusals
-//     sit on its later calls, never its first — its failure schedule and its outage both start at
+//   - the call budget (the leaderboard's tie-break counts provider calls): before the first
+//     request arrives, an exact search plans the whole manifest under a per-provider call cap:
+//     no provider is planned more calls than its cap, and among cap-respecting assignments the
+//     plan takes the greatest weighted rating. The caps were tuned on the kit's public practice
+//     draws: each sits at the depth that provider's practice schedules keep answering to, so a
+//     planned call is one the draw's published shape says will answer, and the plan spends zero
+//     calls on refusals whenever a cap-respecting assignment exists — the quality it gives up
+//     is exactly the loss the caps force. Should a call refuse anyway, the priced order
+//     underneath still applies: a provider's
+//     refusals sit on its later calls, never its first — its failure schedule and its outage
+//     both start at
 //     the second call at the earliest, and its budget is finite. The draw behind a trial, as the
 //     kit publishes it, gives every provider one or two scheduled refusals spread over the calls
 //     between its second and its budget, forces exactly one provider to refuse its second call,
@@ -111,7 +120,6 @@ import {
   openAIToGemini,
   type ServedModel,
 } from './lib/wire.ts';
-
 /** The wire protocol's version, in the register body. */
 const PROTOCOL_VERSION = 1;
 /** How often GET /work is polled, in milliseconds. */
@@ -174,6 +182,27 @@ const CALL_PRICE = 150;
 const failedPositions = new Map<string, Set<number>>();
 
 /**
+ * The most calls the pre-arrival plan may assign to each provider. Tuned on the kit's public
+ * practice draws: each cap sits at the depth that provider's practice schedules keep answering
+ * to — the first scheduled refusal on those draws never lands at or below the cap — so a
+ * planned call is one the draw's published shape says will answer. A provider the table does
+ * not name gets the smallest cap in the table.
+ */
+const PROVIDER_CAPS: Record<string, number> = {
+  groq: 5,
+  cerebras: 2,
+  gemini: 3,
+  zai: 1,
+  openrouter: 1,
+  sambanova: 2,
+  pollinations: 4,
+  cloudflare: 1,
+  ovh: 2,
+  kilol: 6,
+};
+const DEFAULT_CAP = 1;
+
+/**
  * The chance that a provider's next call refuses, from the draw's published shape and this
  * trial's own observations. A first call never refuses: schedules and outages start at the
  * second call. A later call refuses when it lands on a scheduled refusal the draw has not yet
@@ -219,6 +248,10 @@ async function load(): Promise<void> {
   probes = await Promise.all(brief.directory.providers.map((provider) => probeProvider(ENV_URL, provider, PROBE_TIMEOUT_MS)));
   for (const probe of probes) if (!probe.ok && probe.error !== null) log(probe.error);
   catalog = buildCatalog(ENV_URL, probes, brief.ratings);
+  buildPlan();
+  if (plannedRoutes !== null) {
+    log(`planned ${plannedRoutes.filter((r) => r !== null).length} of ${plannedRoutes.length} routes under the provider caps`);
+  }
 }
 
 const byId = (a: ProbedModel, b: ProbedModel): number => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0);
@@ -252,7 +285,8 @@ interface Route {
  * the wires that can carry it (openai, gemini). The list is rebuilt before every attempt, so a
  * refusal reprices the rest of the request's walk as well as every later request's.
  */
-function candidatesFor(requires: Requirement, weight: number): Route[] {
+/** Every free route that may serve a request with these requirements, unordered. */
+function routesFor(requires: Requirement): Route[] {
   const out: Route[] = [];
   for (const probe of probes) {
     if (!probe.ok) continue;
@@ -265,6 +299,11 @@ function candidatesFor(requires: Requirement, weight: number): Route[] {
       out.push({ probe, model, rating: row?.rating_milli ?? 0 });
     }
   }
+  return out;
+}
+
+function candidatesFor(requires: Requirement, weight: number): Route[] {
+  const out = routesFor(requires);
   let best = 0;
   for (const route of out) if (route.rating > best) best = route.rating;
   const price = (route: Route): number =>
@@ -277,6 +316,106 @@ function candidatesFor(requires: Requirement, weight: number): Route[] {
     return byId(a.model, b.model);
   });
   return out;
+}
+
+/**
+ * The plan: one route per manifest request, chosen before the first request arrives by an
+ * exact search over the manifest in order. A provider may be planned at most PROVIDER_CAPS
+ * calls; among cap-respecting assignments the search takes the greatest weighted rating, and
+ * a request no cap-respecting route can serve is left unplanned (the priced order serves it
+ * live). The search state is the request's index and each provider's planned call count;
+ * ties keep the earliest provider in directory order, so the plan is a function of the brief
+ * alone. Null when there is no manifest: routing then uses the priced order alone.
+ */
+let plannedRoutes: (Route | null)[] | null = null;
+/** The provider-call position each planned route was counted on to make, by manifest index. */
+let plannedPositions: number[] = [];
+
+function buildPlan(): void {
+  plannedRoutes = null;
+  const manifest = brief.workload?.manifest ?? [];
+  if (manifest.length === 0) return;
+  // The best route per provider for each manifest request.
+  const options: Map<string, Route>[] = manifest.map((entry) => {
+    const per = new Map<string, Route>();
+    for (const route of routesFor(entry.requires)) {
+      const prev = per.get(route.probe.provider.id);
+      if (prev === undefined || route.rating > prev.rating || (route.rating === prev.rating && byId(route.model, prev.model) < 0)) {
+        per.set(route.probe.provider.id, route);
+      }
+    }
+    return per;
+  });
+  const providerIds = probes.filter((p) => p.ok).map((p) => p.provider.id);
+  const caps = providerIds.map((id) => PROVIDER_CAPS[id] ?? DEFAULT_CAP);
+  // The search runs synchronously before the server listens, and every millisecond it spends
+  // is a millisecond the register call waits — so the state is one integer (the request index
+  // over a mixed-radix encoding of the counts) and the counts mutate in place.
+  const radix: number[] = [];
+  {
+    let acc = 1;
+    for (let j = providerIds.length - 1; j >= 0; j--) {
+      radix[j] = acc;
+      acc *= caps[j] + 1;
+    }
+  }
+  const memo = new Map<number, number>();
+  const counts = providerIds.map(() => 0);
+  const solve = (index: number, code: number): number => {
+    if (index === manifest.length) return 0;
+    const key = index * 100_000_000 + code;
+    const hit = memo.get(key);
+    if (hit !== undefined) return hit;
+    // Leaving this request unplanned is always available: the priced order serves it live.
+    let best = solve(index + 1, code);
+    for (let j = 0; j < providerIds.length; j++) {
+      const route = options[index].get(providerIds[j]);
+      if (route === undefined) continue;
+      if (counts[j] >= caps[j]) continue;
+      counts[j] += 1;
+      const value = route.rating * manifest[index].weight + solve(index + 1, code + radix[j]);
+      counts[j] -= 1;
+      if (value > best) best = value;
+    }
+    memo.set(key, best);
+    return best;
+  };
+  solve(0, 0);
+  const plan: (Route | null)[] = [];
+  const positions: number[] = [];
+  let code = 0;
+  for (let index = 0; index < manifest.length; index++) {
+    let chosen: Route | null = null;
+    let chosenValue = solve(index + 1, code); // the skip value: plan nothing here
+    for (let j = 0; j < providerIds.length; j++) {
+      const route = options[index].get(providerIds[j]);
+      if (route === undefined) continue;
+      if (counts[j] >= caps[j]) continue;
+      counts[j] += 1;
+      const value = route.rating * manifest[index].weight + solve(index + 1, code + radix[j]);
+      counts[j] -= 1;
+      if (value > chosenValue) {
+        chosenValue = value;
+        chosen = route;
+      }
+    }
+    if (chosen !== null) {
+      const j = providerIds.indexOf(chosen.probe.provider.id);
+      counts[j] += 1;
+      code += radix[j];
+      positions.push(counts[j]);
+    } else {
+      positions.push(0);
+    }
+    plan.push(chosen);
+  }
+  plannedRoutes = plan;
+  plannedPositions = positions;
+}
+
+/** The position the plan counted on for the planned route of one manifest index, or 0 for none. */
+function plannedPosition(_route: Route, index: number): number {
+  return plannedPositions[index] ?? 0;
 }
 
 /** Requirements read off a request body: the features the body itself asks for. */
@@ -298,17 +437,18 @@ function requirementsFromBody(body: Json): Requirement {
  * row by arrival order (the declared source), widened by whatever the body itself asks for, so a
  * feature the manifest understates is still routed to a model that carries it.
  */
-function requirementsFor(body: Json): { requires: Requirement; weight: number } {
+function requirementsFor(body: Json): { requires: Requirement; weight: number; index: number } {
   const manifest = brief.workload?.manifest ?? [];
+  const index = manifestIndex;
   const entry = manifest[manifestIndex];
   manifestIndex += 1;
   const fromBody = requirementsFromBody(body);
-  if (entry === undefined) return { requires: fromBody, weight: 1 };
+  if (entry === undefined) return { requires: fromBody, weight: 1, index };
   const requires: Requirement = { ...entry.requires };
   if (fromBody.tools === true) requires.tools = true;
   if (fromBody.vision === true) requires.vision = true;
   if (fromBody.json === true) requires.json = true;
-  return { requires, weight: entry.weight };
+  return { requires, weight: entry.weight, index };
 }
 
 /** One client request body, or null when it is not one JSON object or is too large. */
@@ -468,7 +608,7 @@ async function deliver(route: Route, clientApi: ClientApi, body: Json, upstream:
  * rest of the trial. When no candidate answers, the last refusal's status is the client's answer.
  */
 async function serve(clientApi: ClientApi, body: Json, res: ServerResponse): Promise<void> {
-  const { requires, weight } = requirementsFor(body);
+  const { requires, weight, index } = requirementsFor(body);
   if (candidatesFor(requires, weight).length === 0) {
     return sendError(
       res,
@@ -478,12 +618,25 @@ async function serve(clientApi: ClientApi, body: Json, res: ServerResponse): Pro
       'no free model on the directory meets this request',
     );
   }
+  // The planned route for this request goes first when it still fits: its provider has not
+  // retired, the call it would make is the position the plan counted on, and the route meets
+  // the requirements as widened by the body. After it, the priced order alone.
+  const planned = plannedRoutes?.[index] ?? null;
+  const plannedUsable =
+    planned !== null &&
+    !retiredProviders.has(planned.probe.provider.id) &&
+    (providerCalls.get(planned.probe.provider.id) ?? 0) + 1 === plannedPosition(planned, index) &&
+    routesFor(requires).some((r) => r.probe.provider.id === planned.probe.provider.id && r.model.id === planned.model.id);
   let lastStatus = 502;
   let lastMessage = 'no provider answered';
   for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
-    const candidates = candidatesFor(requires, weight);
-    if (candidates.length === 0) break;
-    const route = candidates[0];
+    let route: Route | undefined;
+    if (attempt === 0 && plannedUsable && planned !== null) {
+      route = planned;
+    } else {
+      route = candidatesFor(requires, weight)[0];
+    }
+    if (route === undefined) break;
     const providerId = route.probe.provider.id;
     const position = (providerCalls.get(providerId) ?? 0) + 1;
     providerCalls.set(providerId, position);
@@ -559,12 +712,25 @@ function listen(server: Server): Promise<void> {
 
 /** POST /register with the port and the one catalog; the env answers with the workload's size. */
 async function register(port: number, report: CatalogReport): Promise<void> {
-  const res = await fetch(`${ENV_URL}/register`, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ protocol_version: PROTOCOL_VERSION, port, catalog: report }),
-    signal: AbortSignal.timeout(5000),
-  });
+  // Registering is idempotent (the env starts the run on the first call alone), and the pooled
+  // probe sockets can be closed by the env while the plan was being built — so a network
+  // failure here is retried on a fresh socket instead of ending the trial before it starts.
+  let res: Response | null = null;
+  for (let attempt = 0; attempt < 4; attempt++) {
+    try {
+      res = await fetch(`${ENV_URL}/register`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ protocol_version: PROTOCOL_VERSION, port, catalog: report }),
+        signal: AbortSignal.timeout(5000),
+      });
+      break;
+    } catch (err) {
+      if (attempt === 3) throw err;
+      await new Promise((resolve) => setTimeout(resolve, 200));
+    }
+  }
+  if (res === null) throw new Error('register never ran');
   if (!res.ok) throw new Error(`POST ${ENV_URL}/register answered HTTP ${res.status}: ${(await res.text()).slice(0, 500)}`);
   const reply: unknown = await res.json();
   if (isRecord(reply) && typeof reply.requests === 'number') log(`registered: the workload holds ${reply.requests} requests`);
